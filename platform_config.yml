@@ -1,0 +1,21 @@
+platforms:
+  instagram:
+    workers: 3
+    accounts: 5
+    ips: 5
+    max_concurrent_browsers: 3
+    queue_name: scrape_instagram
+
+  tiktok:
+    workers: 2
+    accounts: 3
+    ips: 3
+    max_concurrent_browsers: 2
+    queue_name: scrape_tiktok
+
+  facebook:
+    workers: 2
+    accounts: 3
+    ips: 3
+    max_concurrent_browsers: 2
+    queue_name: scrape_facebook

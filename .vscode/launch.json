@@ -1,0 +1,44 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "API Server (Debug)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "uvicorn",
+            "args": [
+                "api.main:app",
+                "--host", "0.0.0.0",
+                "--port", "8000"
+            ],
+            "cwd": "${workspaceFolder}",
+            "envFile": "${workspaceFolder}/.env",
+            "justMyCode": false
+        },
+        {
+            "name": "Worker - All Platforms",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "workers.runner",
+            "cwd": "${workspaceFolder}",
+            "envFile": "${workspaceFolder}/.env",
+            "justMyCode": false
+        },
+        {
+            "name": "Worker - Instagram",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "workers.runner",
+            "args": ["--platform", "instagram"],
+            "cwd": "${workspaceFolder}",
+            "envFile": "${workspaceFolder}/.env",
+            "justMyCode": false
+        }
+    ],
+    "compounds": [
+        {
+            "name": "API + Worker (Debug Both)",
+            "configurations": ["API Server (Debug)", "Worker - All Platforms"]
+        }
+    ]
+}

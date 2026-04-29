@@ -1,0 +1,136 @@
+"""Job state management with full lifecycle tracking.
+
+Provides sync (workers) and async (API) managers for
+PENDING → PROCESSING → COMPLETED/FAILED state machine.
+
+Redis storage: HASH at ``job:{job_id}`` with TTL.
+Dedup key: ``job:active:{platform}:{username}`` with TTL.
+"""
+import json
+import time
+from typing import Optional
+
+import redis
+import redis.asyncio as aioredis
+
+from core.config import Config
+from core.logging_config import get_logger
+
+logger = get_logger(__name__)
+
+# ── State constants ────────────────────────────────────────────────
+
+PENDING = "pending"
+PROCESSING = "processing"
+COMPLETED = "completed"
+FAILED = "failed"
+
+
+def _job_key(job_id: str) -> str:
+    return f"job:{job_id}"
+
+
+def _dedup_key(platform: str, username: str) -> str:
+    return f"job:active:{platform}:{username}"
+
+
+# ── Sync (workers) ────────────────────────────────────────────────
+
+
+class JobStateManager:
+    """Sync job state manager used by RQ workers."""
+
+    def __init__(self, r: redis.Redis) -> None:
+        self._redis = r
+
+    def set_processing(self, job_id: str, username: str, platform: str) -> None:
+        key = _job_key(job_id)
+        now = str(time.time())
+        created = self._redis.hget(key, "created_at") or now
+        self._redis.hset(key, mapping={
+            "status": PROCESSING,
+            "username": username,
+            "platform": platform,
+            "result": "",
+            "error": "",
+            "created_at": created,
+            "updated_at": now,
+        })
+        self._redis.expire(key, Config.JOB_RESULT_TTL_SECONDS)
+        logger.info(
+            f"Job {job_id} → PROCESSING",
+            extra={"job_id": job_id, "platform": platform, "username": username},
+        )
+
+    def set_completed(self, job_id: str, result: dict) -> None:
+        key = _job_key(job_id)
+        self._redis.hset(key, mapping={
+            "status": COMPLETED,
+            "result": json.dumps(result),
+            "error": "",
+            "updated_at": str(time.time()),
+        })
+        self._redis.expire(key, Config.JOB_RESULT_TTL_SECONDS)
+
+    def set_failed(self, job_id: str, error: str) -> None:
+        key = _job_key(job_id)
+        self._redis.hset(key, mapping={
+            "status": FAILED,
+            "error": error,
+            "updated_at": str(time.time()),
+        })
+        self._redis.expire(key, Config.JOB_RESULT_TTL_SECONDS)
+
+    def clear_dedup(self, platform: str, username: str) -> None:
+        self._redis.delete(_dedup_key(platform, username))
+
+
+# ── Async (API) ───────────────────────────────────────────────────
+
+
+class AsyncJobStateManager:
+    """Async job state manager used by the FastAPI layer."""
+
+    def __init__(self, r: aioredis.Redis) -> None:
+        self._redis = r
+
+    async def create_pending(
+        self, job_id: str, username: str, platform: str
+    ) -> None:
+        key = _job_key(job_id)
+        now = str(time.time())
+        await self._redis.hset(key, mapping={
+            "status": PENDING,
+            "username": username,
+            "platform": platform,
+            "result": "",
+            "error": "",
+            "created_at": now,
+            "updated_at": now,
+        })
+        await self._redis.expire(key, Config.JOB_RESULT_TTL_SECONDS)
+
+    async def get_state(self, job_id: str) -> Optional[dict]:
+        key = _job_key(job_id)
+        data = await self._redis.hgetall(key)
+        if not data:
+            return None
+        if data.get("result"):
+            try:
+                data["result"] = json.loads(data["result"])
+            except (json.JSONDecodeError, TypeError):
+                data["result"] = None
+        else:
+            data["result"] = None
+        return data
+
+    async def set_dedup(
+        self, platform: str, username: str, job_id: str
+    ) -> None:
+        key = _dedup_key(platform, username)
+        await self._redis.setex(key, Config.JOB_DEDUP_TTL_SECONDS, job_id)
+
+    async def get_dedup(
+        self, platform: str, username: str
+    ) -> Optional[str]:
+        return await self._redis.get(_dedup_key(platform, username))
