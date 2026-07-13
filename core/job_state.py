@@ -84,6 +84,19 @@ class JobStateManager:
     def clear_dedup(self, platform: str, username: str) -> None:
         self._redis.delete(_dedup_key(platform, username))
 
+    def refresh_dedup(self, platform: str, username: str) -> None:
+        """Extend the dedup key's TTL to the full ``JOB_DEDUP_TTL_SECONDS``.
+
+        A job that hits retries (backoff + multiple attempts) can run long
+        enough that the dedup key set at dispatch time expires while the job
+        is still in flight, letting a second identical request slip past the
+        dedup guard and dispatch a duplicate job for the same target. The
+        executor calls this before each retry so the guard lasts as long as
+        the job is actually running, not just its original TTL window.
+        EXPIRE on an already-gone key is a harmless no-op.
+        """
+        self._redis.expire(_dedup_key(platform, username), Config.JOB_DEDUP_TTL_SECONDS)
+
 
 # ── Async (API) ───────────────────────────────────────────────────
 
@@ -119,6 +132,11 @@ class AsyncJobStateManager:
             try:
                 data["result"] = json.loads(data["result"])
             except (json.JSONDecodeError, TypeError):
+                logger.warning(
+                    "Corrupt result JSON for job %s; returning result=None",
+                    job_id,
+                    extra={"job_id": job_id},
+                )
                 data["result"] = None
         else:
             data["result"] = None

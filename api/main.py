@@ -51,6 +51,20 @@ async def lifespan(app: FastAPI):
     # Allow more threads for the handful of sync RQ calls
     limiter = anyio.to_thread.current_default_thread_limiter()
     limiter.total_tokens = 100
+    # In production, CURSOR_SIGNING_KEY must be explicitly set. Unlike
+    # METRICS_AUTH_TOKEN/ADMIN_AUTH_TOKEN (which fail closed by denying
+    # requests when unset), an unset cursor key falls back to a per-process
+    # random key — safe for a single dev instance, but with multiple API
+    # replicas behind a load balancer it causes intermittent "cursor
+    # signature mismatch" failures depending on which instance signed vs.
+    # verified a given cursor. Refuse to boot rather than serve that
+    # instance-dependent behavior in production.
+    if Config.ENVIRONMENT == "production" and not Config.CURSOR_SIGNING_KEY:
+        raise RuntimeError(
+            "CURSOR_SIGNING_KEY must be set when ENVIRONMENT=production "
+            "(unset falls back to a per-process random key, which breaks "
+            "cursor verification across multiple API instances)."
+        )
     # Initialise the cursor signer up-front so the env-var warning (if any)
     # appears at startup rather than on the first request.
     get_cursor_signer()

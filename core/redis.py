@@ -14,6 +14,7 @@ from core.config import Config
 
 _async_pool: Optional[aioredis.Redis] = None
 _sync_pool: Optional[redis.Redis] = None
+_rq_pool: Optional[redis.Redis] = None
 
 
 @dataclass(frozen=True)
@@ -78,12 +79,25 @@ def get_sync_redis(decode_responses: bool = True) -> redis.Redis:
 
 
 def get_rq_connection() -> redis.Redis:
-    """Get raw Redis connection for RQ (no decode_responses)."""
-    return redis.from_url(
-        Config.REDIS_URL,
-        socket_timeout=Config.REDIS_SOCKET_TIMEOUT,
-        socket_connect_timeout=Config.REDIS_SOCKET_CONNECT_TIMEOUT,
-    )
+    """Get the shared raw Redis connection pool for RQ (no decode_responses).
+
+    Cached as a singleton and bounded by ``REDIS_MAX_CONNECTIONS``, matching
+    ``get_sync_redis``/``get_async_redis``. Previously this constructed a
+    brand-new, unbounded connection pool on every call; that was safe only
+    because every call site happened to cache the result itself, with no
+    guarantee enforced here — a future per-request caller would have opened
+    an unbounded pool per call, risking exhausting Redis's ``maxclients``
+    under load.
+    """
+    global _rq_pool
+    if _rq_pool is None:
+        _rq_pool = redis.from_url(
+            Config.REDIS_URL,
+            max_connections=Config.REDIS_MAX_CONNECTIONS,
+            socket_timeout=Config.REDIS_SOCKET_TIMEOUT,
+            socket_connect_timeout=Config.REDIS_SOCKET_CONNECT_TIMEOUT,
+        )
+    return _rq_pool
 
 
 # ── Health probe ──────────────────────────────────────────────────

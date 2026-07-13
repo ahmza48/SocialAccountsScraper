@@ -48,16 +48,6 @@ class ParsingError(ScrapingError):
     pass
 
 
-class QueueFullError(ScraperBaseError):
-    """Queue has exceeded max capacity (backpressure)."""
-    pass
-
-
-class DuplicateJobError(ScraperBaseError):
-    """A job for this username+platform is already active."""
-    pass
-
-
 class CircuitOpenError(ScraperBaseError):
     """Circuit breaker is open — platform temporarily unavailable."""
     pass

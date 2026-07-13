@@ -256,6 +256,7 @@ def execute_scrape_job(
                     job_id, type(e).__name__, e,
                     extra={"job_id": job_id},
                 )
+                job_state.refresh_dedup(platform, username)
                 retry_ctx.wait()
 
             except Exception as e:
@@ -269,6 +270,7 @@ def execute_scrape_job(
                 circuit.record_failure(platform)
                 if not retry_ctx.should_retry(e):
                     raise
+                job_state.refresh_dedup(platform, username)
                 retry_ctx.wait()
 
     except Exception as e:

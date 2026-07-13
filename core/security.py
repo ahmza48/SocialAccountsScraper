@@ -225,6 +225,11 @@ def verify_metrics_token(authorization_header: Optional[str]) -> bool:
 
     Returns ``False`` (deny) when ``METRICS_AUTH_TOKEN`` is unset — fail-closed
     so a forgotten env var doesn't expose internal stats.
+
+    Reads ``os.getenv`` directly (rather than the cached ``Config`` class
+    attribute) so a token rotated via the environment takes effect on the
+    next request without requiring a process restart to re-import
+    ``core.config``.
     """
     return _verify_bearer(authorization_header, os.getenv("METRICS_AUTH_TOKEN"))
 
