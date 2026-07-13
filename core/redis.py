@@ -3,7 +3,9 @@
 Provides async pool (API layer) and sync pool (worker layer)
 with configurable connection limits and timeouts.
 """
+from dataclasses import dataclass
 from typing import Optional
+from uuid import uuid4
 
 import redis
 import redis.asyncio as aioredis
@@ -12,6 +14,23 @@ from core.config import Config
 
 _async_pool: Optional[aioredis.Redis] = None
 _sync_pool: Optional[redis.Redis] = None
+
+
+@dataclass(frozen=True)
+class RedisHealth:
+    """Result of an end-to-end Redis health probe.
+
+    ``ok`` is the overall verdict (PING + write/read round-trip succeeded).
+    ``ping_ok`` and ``write_ok`` allow callers (e.g. /readyz) to distinguish
+    a hard-down Redis from a read-only replica or quota-throttled cluster.
+    ``error`` carries the last exception class name for log/metric tagging
+    without leaking server internals to clients.
+    """
+
+    ok: bool
+    ping_ok: bool
+    write_ok: bool
+    error: Optional[str] = None
 
 
 async def get_async_redis() -> aioredis.Redis:
@@ -64,4 +83,48 @@ def get_rq_connection() -> redis.Redis:
         Config.REDIS_URL,
         socket_timeout=Config.REDIS_SOCKET_TIMEOUT,
         socket_connect_timeout=Config.REDIS_SOCKET_CONNECT_TIMEOUT,
+    )
+
+
+# ── Health probe ──────────────────────────────────────────────────
+
+
+# Short TTL on the probe key so an unhealthy DEL still reaps the value
+# without leaving debris behind.
+_HEALTH_PROBE_TTL_SECONDS = 5
+
+
+async def async_redis_health(client: aioredis.Redis) -> RedisHealth:
+    """Probe an async Redis client with PING + write/read round-trip.
+
+    A bare ``PING`` only proves the socket is alive; it does not catch
+    read-only replicas, write-quota throttling, or eviction storms that
+    silently drop SET commands. We follow up with a SETEX/GET/DEL on a
+    namespaced random key so /readyz reflects the state callers actually
+    need.
+    """
+    ping_ok = False
+    write_ok = False
+    error: Optional[str] = None
+    try:
+        ping_ok = bool(await client.ping())
+    except Exception as exc:  # pragma: no cover - exercised via fakeredis injection
+        error = type(exc).__name__
+        return RedisHealth(ok=False, ping_ok=False, write_ok=False, error=error)
+
+    probe_key = f"health:probe:{uuid4().hex}"
+    expected = "1"
+    try:
+        await client.set(probe_key, expected, ex=_HEALTH_PROBE_TTL_SECONDS)
+        observed = await client.get(probe_key)
+        await client.delete(probe_key)
+        write_ok = observed == expected
+    except Exception as exc:
+        error = type(exc).__name__
+
+    return RedisHealth(
+        ok=ping_ok and write_ok,
+        ping_ok=ping_ok,
+        write_ok=write_ok,
+        error=error,
     )

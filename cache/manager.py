@@ -86,13 +86,30 @@ class CacheManager:
     # ── Invalidation ───────────────────────────────────────────────
 
     def invalidate(self, platform: str, username: str):
-        """Invalidate all cached data for a user on a platform."""
-        pattern = f"profile:{platform}:{username}*"
+        """Invalidate every cache entry for a (platform, username) pair.
+
+        The previous implementation used ``profile:{platform}:{username}*``
+        as the SCAN match, which over-matched: invalidating ``alice`` would
+        also drop ``alice2`` because the trailing wildcard had no boundary.
+        We now delete the bare profile key directly and scan only the
+        cursor namespace (``profile:{p}:{u}:cursor:*``) which is unambiguous.
+        """
+        profile_key = self._profile_key(platform, username)
+        cursor_pattern = f"{profile_key}:cursor:*"
+
+        # 1. Delete the bare profile key. ``delete`` is a no-op on miss so
+        #    we don't need an EXISTS guard.
+        self._redis.delete(profile_key)
+
+        # 2. SCAN-and-DELETE the cursor pages. The colon prefix prevents
+        #    matches against unrelated usernames sharing a name prefix.
         cursor_pos = 0
         while True:
-            cursor_pos, keys = self._redis.scan(cursor_pos, match=pattern, count=100)
+            cursor_pos, keys = self._redis.scan(
+                cursor_pos, match=cursor_pattern, count=100
+            )
             if keys:
                 self._redis.delete(*keys)
             if cursor_pos == 0:
                 break
-        logger.info(f"Cache INVALIDATED: {pattern}")
+        logger.info("Cache INVALIDATED for %s@%s", username, platform)

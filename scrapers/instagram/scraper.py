@@ -3,6 +3,7 @@ import json
 from scrapers.base import BaseScraper
 from core.logging_config import get_logger
 from core.exceptions import ParsingError, ScrapingError, AccountBlockedError
+from core.platforms import Platform
 from utils.anti_detection import human_delay
 
 logger = get_logger(__name__)
@@ -11,7 +12,7 @@ logger = get_logger(__name__)
 class InstagramScraper(BaseScraper):
     """Instagram scraper using web API endpoints (not UI scrolling)."""
 
-    PLATFORM = "instagram"
+    PLATFORM = Platform.INSTAGRAM.value
     BASE_URL = "https://www.instagram.com"
 
     def _navigate_to_platform(self):

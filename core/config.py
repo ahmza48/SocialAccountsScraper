@@ -1,5 +1,7 @@
 import os
 
+from core.platforms import Platform
+
 
 class Config:
     """Central configuration loaded from environment variables."""
@@ -15,7 +17,12 @@ class Config:
     JOB_TIMEOUT_SECONDS: int = int(os.getenv("JOB_TIMEOUT_SECONDS", "120"))
 
     # Cache
-    CACHE_TTL_SECONDS: int = int(os.getenv("CACHE_TTL_SECONDS", "600"))
+    # Default raised from 600s → 3600s to match CURSOR_TTL_SECONDS so a
+    # client walking signed cursors keeps hitting the cache for as long as
+    # those cursors stay valid (see core.security). Setting this lower than
+    # CURSOR_TTL_SECONDS is allowed but emits a startup warning because it
+    # means page-2 requests can re-scrape with shifted underlying data.
+    CACHE_TTL_SECONDS: int = int(os.getenv("CACHE_TTL_SECONDS", "3600"))
     CACHE_LOCK_TIMEOUT: int = int(os.getenv("CACHE_LOCK_TIMEOUT", "10"))
 
     # Anti-detection
@@ -34,8 +41,8 @@ class Config:
     # Sessions
     SESSION_STORAGE_DIR: str = os.getenv("SESSION_STORAGE_DIR", "sessions/storage")
 
-    # Queues
-    SUPPORTED_PLATFORMS: list = ["instagram", "tiktok", "facebook"]
+    # Queues — derived from the Platform enum so adding a platform updates this list.
+    SUPPORTED_PLATFORMS: list = Platform.values()
     QUEUE_MAX_LENGTH: int = int(os.getenv("QUEUE_MAX_LENGTH", "1000"))
 
     # Circuit breaker
@@ -47,8 +54,29 @@ class Config:
     JOB_RESULT_TTL_SECONDS: int = int(os.getenv("JOB_RESULT_TTL_SECONDS", "3600"))
     JOB_DEDUP_TTL_SECONDS: int = int(os.getenv("JOB_DEDUP_TTL_SECONDS", "300"))
 
+    # Dead-letter queue
+    # Hard cap on the per-platform DLQ list. Older entries are trimmed away
+    # in the same pipeline as the push so we never silently grow unbounded.
+    # Total dropped events are tracked via metrics:dlq:{platform}:dropped.
+    DLQ_MAX_LENGTH: int = int(os.getenv("DLQ_MAX_LENGTH", "10000"))
+
     # Platform config
     PLATFORM_CONFIG_PATH: str = os.getenv("PLATFORM_CONFIG_PATH", "platform_config.yml")
+
+    # Security
+    # HMAC key for signing pagination cursors. REQUIRED in production; if
+    # unset a per-process random key is generated (see core.security).
+    CURSOR_SIGNING_KEY: str = os.getenv("CURSOR_SIGNING_KEY", "")
+    # Bearer token for /metrics. If unset, /metrics is denied to all callers
+    # (fail-closed). Set to a long random secret in production.
+    METRICS_AUTH_TOKEN: str = os.getenv("METRICS_AUTH_TOKEN", "")
+    # Bearer token for /admin/*. If unset, admin endpoints are denied to all
+    # callers (fail-closed). MUST be distinct from METRICS_AUTH_TOKEN so a
+    # leaked metrics token cannot mutate accounts or jobs.
+    ADMIN_AUTH_TOKEN: str = os.getenv("ADMIN_AUTH_TOKEN", "")
+    # TTL for signed cursor tokens (seconds). After this clients must re-issue
+    # the original search to obtain fresh pagination tokens.
+    CURSOR_TTL_SECONDS: int = int(os.getenv("CURSOR_TTL_SECONDS", "3600"))
 
     # Logging
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")

@@ -14,6 +14,7 @@ Usage:
 import sys
 import os
 import argparse
+import signal
 
 # Ensure project root is on sys.path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -27,6 +28,37 @@ from core.logging_config import get_logger
 from core.platform_config import get_platform_config
 
 logger = get_logger(__name__)
+
+
+def _install_signal_handlers(worker: SimpleWorker) -> None:
+    """Install graceful-shutdown handlers for SIGTERM and SIGINT.
+
+    On the first signal we ask RQ to stop after the current job finishes so
+    Playwright contexts, account locks, and browser-slot counters get released
+    cleanly. A second signal triggers an immediate exit (covers stuck jobs).
+    """
+    shutdown_requested = {"count": 0}
+
+    def _handle(signum: int, _frame: object) -> None:
+        shutdown_requested["count"] += 1
+        if shutdown_requested["count"] == 1:
+            logger.info(
+                f"Received signal {signum}; finishing current job then exiting. "
+                f"Send the signal again to force-exit."
+            )
+            try:
+                worker.request_stop(signum, _frame)
+            except Exception:
+                logger.exception("request_stop() failed; falling back to sys.exit")
+                sys.exit(1)
+        else:
+            logger.warning(
+                f"Received signal {signum} again; forcing immediate exit."
+            )
+            sys.exit(1)
+
+    signal.signal(signal.SIGTERM, _handle)
+    signal.signal(signal.SIGINT, _handle)
 
 
 def start_worker(platform: str = None) -> None:
@@ -47,6 +79,9 @@ def start_worker(platform: str = None) -> None:
     logger.info(f"Starting worker — listening on queues: {queue_names}")
 
     worker = SimpleWorker(queues, connection=conn)
+    _install_signal_handlers(worker)
+    # Disable RQ's own signal handlers so ours stay in effect; we still want
+    # the worker's normal job-execution loop, just not its abrupt shutdown.
     worker.work(with_scheduler=False)
 
 

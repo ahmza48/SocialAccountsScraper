@@ -1,21 +1,28 @@
-"""Hardened job executor with concurrency control, circuit breaker, and smart retries.
+"""Job executor with concurrency control, circuit breaker, and smart retries.
 
 Called by RQ workers. Each invocation:
-    1. Acquires a browser slot (global + per-platform limit)
-    2. Acquires an account (distributed lock + cooldown)
-    3. Takes a cache stampede lock
-    4. Runs the platform scraper (Playwright)
-    5. Stores result, updates job state, releases resources
-    6. Reports success/failure to the circuit breaker
-"""
-import importlib
-import json
 
-from core.config import Config
-from core.logging_config import get_logger
-from core.redis import get_sync_redis
-from core.job_state import JobStateManager
-from core.platform_config import get_platform_config
+1. Acquires a browser slot (global + per-platform limit)
+2. Acquires an account (distributed lock + cooldown)
+3. Takes a cache stampede lock
+4. Runs the platform scraper (Playwright)
+5. Stores result, updates job state, releases resources
+6. Reports success/failure to the circuit breaker
+
+Resource acquisition is delegated to small context managers in
+:mod:`workers.resources` so this module only contains the execution-flow
+logic (single-attempt orchestration + retry classification + terminal-state
+bookkeeping). Each piece is independently unit-testable.
+"""
+from __future__ import annotations
+
+import importlib
+from typing import Optional
+
+import redis
+
+from account_pool.manager import AccountPoolManager
+from cache.manager import CacheManager
 from core.exceptions import (
     AccountBlockedError,
     AccountUnavailableError,
@@ -24,30 +31,143 @@ from core.exceptions import (
     ScrapingError,
     SessionExpiredError,
 )
-from account_pool.manager import AccountPoolManager
-from sessions.manager import SessionManager
-from cache.manager import CacheManager
+from core.job_state import JobStateManager
+from core.logging_config import get_logger
+from core.platform_config import PlatformConfig, get_platform_config
+from core.platforms import Platform, parse_platform
+from core.redis import get_sync_redis
 from queues.dead_letter import DeadLetterQueue
-from utils.metrics import increment_counter, TimingContext
-from utils.retry import RetryContext
+from sessions.manager import SessionManager
 from utils.circuit_breaker import CircuitBreaker
-from utils.concurrency import BrowserConcurrencyGuard
+from utils.metrics import TimingContext, increment_counter
+from utils.retry import RetryContext
+from workers.resources import (
+    RELEASE_IDLE,
+    RELEASE_INVALID,
+    JobOutcome,
+    acquired_account,
+    browser_slot,
+    cache_lock,
+)
 
 logger = get_logger(__name__)
 
-SCRAPER_MAP = {
-    "instagram": "scrapers.instagram.scraper.InstagramScraper",
-    "tiktok": "scrapers.tiktok.scraper.TikTokScraper",
-    "facebook": "scrapers.facebook.scraper.FacebookScraper",
+# Mapping from canonical Platform enum to the dotted import path of the
+# scraper class. Keyed by the enum so a typo in a string platform name
+# becomes a KeyError at import time, not a silent missing-platform bug.
+SCRAPER_MAP: dict = {
+    Platform.INSTAGRAM: "scrapers.instagram.scraper.InstagramScraper",
+    Platform.TIKTOK: "scrapers.tiktok.scraper.TikTokScraper",
+    Platform.FACEBOOK: "scrapers.facebook.scraper.FacebookScraper",
 }
 
 
-def _get_scraper_class(platform: str):
+def _get_scraper_class(platform: Platform):
     """Dynamically import the scraper class for a given platform."""
     dotted_path = SCRAPER_MAP[platform]
     module_path, class_name = dotted_path.rsplit(".", 1)
     module = importlib.import_module(module_path)
     return getattr(module, class_name)
+
+
+# ── Single-attempt orchestration ──────────────────────────────────
+
+
+def _run_single_attempt(
+    *,
+    sync_redis: redis.Redis,
+    pc: PlatformConfig,
+    job_state: JobStateManager,
+    account_pool: AccountPoolManager,
+    session_mgr: SessionManager,
+    cache_mgr: CacheManager,
+    circuit: CircuitBreaker,
+    outcome: JobOutcome,
+    platform_enum: Platform,
+    job_id: str,
+    username: str,
+    cursor: Optional[str],
+    log,
+) -> Optional[dict]:
+    """Run one scrape attempt end-to-end (slot \u2192 account \u2192 cache \u2192 scrape).
+
+    Returns the scrape result on success. Re-raises typed scraper exceptions
+    after marking the account context with the appropriate release mode so
+    the surrounding context manager performs the right cleanup
+    (mark-invalid, release-idle, or normal cooldown).
+    """
+    platform = platform_enum.value
+    with browser_slot(sync_redis, platform, pc.max_browsers(platform)):
+        with acquired_account(account_pool, platform, job_id) as acct:
+            try:
+                with cache_lock(cache_mgr, platform, username) as lock:
+                    # Another worker is currently populating the cache for
+                    # this (platform, username). If their result has already
+                    # landed we can serve it without doing our own scrape;
+                    # otherwise we fall through and scrape ourselves.
+                    if not lock.held:
+                        log.info(
+                            "Cache lock held by another worker for %s@%s",
+                            username, platform,
+                        )
+                        cached = cache_mgr.get_profile(platform, username)
+                        if cached is not None:
+                            job_state.set_completed(job_id, cached)
+                            outcome.mark_terminal()
+                            circuit.record_success(platform)
+                            increment_counter("jobs_completed", platform)
+                            # Account wasn't really used \u2014 skip cooldown.
+                            acct.release_mode = RELEASE_IDLE
+                            return cached
+
+                    ScraperClass = _get_scraper_class(platform_enum)
+                    scraper = ScraperClass(acct.data, session_mgr)
+
+                    with TimingContext("scrape_duration", platform):
+                        result = scraper.execute(username, cursor)
+
+                    cache_mgr.set_profile(platform, username, result)
+                    if result.get("next_cursor"):
+                        cache_mgr.set_page(
+                            platform, username, result["next_cursor"], result
+                        )
+
+                    job_state.set_completed(job_id, result)
+                    outcome.mark_terminal()
+                    circuit.record_success(platform)
+                    increment_counter("jobs_completed", platform)
+                    log.info(
+                        "Job %s completed successfully", job_id,
+                        extra={"job_id": job_id},
+                    )
+                    return result
+
+            except AccountBlockedError as e:
+                # Account is banned/blocked at the platform level; permanently
+                # remove from the pool so subsequent jobs don't pick it.
+                circuit.record_failure(platform)
+                acct.release_mode = RELEASE_INVALID
+                acct.invalid_reason = str(e)
+                raise
+
+            except SessionExpiredError as e:
+                # Session is dead but the account itself is fine; mark the
+                # session record invalid and release the account without
+                # cooldown so it can be picked up immediately by another job
+                # (which will re-login).
+                session_mgr.mark_invalid(platform, acct.account_id, str(e))
+                acct.release_mode = RELEASE_IDLE
+                raise
+
+            except (ParsingError, ScrapingError, BrowserLimitError):
+                # These failure classes don't taint the account; let the
+                # default cooldown release apply and re-raise for the
+                # outer retry classifier to handle.
+                circuit.record_failure(platform)
+                raise
+
+
+# ── Public entry point ────────────────────────────────────────────
 
 
 def execute_scrape_job(
@@ -56,191 +176,134 @@ def execute_scrape_job(
     platform: str,
     cursor: str = None,
 ):
-    """Main job execution function — called by RQ workers.
+    """Main job execution function \u2014 called by RQ workers.
 
-    Failure categories:
-        - AccountBlockedError  → mark account invalid, retry with new account
-        - SessionExpiredError  → mark session invalid, retry (no cooldown)
-        - BrowserLimitError    → wait for slot, retry
-        - ParsingError         → non-retryable, push to DLQ immediately
-        - ScrapingError/other  → retry with exponential backoff
+    ``platform`` is accepted as a plain string (RQ serialises job kwargs as
+    JSON, so we can't take a :class:`Platform` directly across the wire) but
+    is immediately coerced to the enum so the rest of the function uses a
+    type-safe value.
+
+    Failure handling:
+
+    * ``AccountBlockedError`` \u2014 mark account invalid, retry with new account
+    * ``SessionExpiredError`` \u2014 mark session invalid, retry (no cooldown)
+    * ``BrowserLimitError`` \u2014 wait for slot, retry
+    * ``ParsingError`` \u2014 non-retryable, push to DLQ immediately
+    * ``ScrapingError`` / other \u2014 retry with exponential backoff
     """
+    platform_enum = parse_platform(platform)
+    platform = platform_enum.value  # canonical string for downstream consumers
+
     log = get_logger(f"worker.{platform}")
     log.info(
-        f"Starting job {job_id}: {username}@{platform}",
+        "Starting job %s: %s@%s", job_id, username, platform,
         extra={"job_id": job_id, "platform": platform, "username": username},
     )
 
-    r = get_sync_redis()
+    sync_redis = get_sync_redis()
     pc = get_platform_config()
-    job_state = JobStateManager(r)
+    job_state = JobStateManager(sync_redis)
     account_pool = AccountPoolManager()
     session_mgr = SessionManager()
     cache_mgr = CacheManager()
     dlq = DeadLetterQueue()
-    circuit = CircuitBreaker(r)
+    circuit = CircuitBreaker(sync_redis)
 
     job_state.set_processing(job_id, username, platform)
 
     retry_ctx = RetryContext()
-    account = None
+    outcome = JobOutcome()
     attempt = 0
 
     try:
         while True:
             attempt += 1
-            account = None
-
             try:
-                # ── 1. Acquire browser slot (waits up to 60s) ──
-                browser_guard = BrowserConcurrencyGuard(
-                    r, platform, pc.max_browsers(platform)
+                return _run_single_attempt(
+                    sync_redis=sync_redis,
+                    pc=pc,
+                    job_state=job_state,
+                    account_pool=account_pool,
+                    session_mgr=session_mgr,
+                    cache_mgr=cache_mgr,
+                    circuit=circuit,
+                    outcome=outcome,
+                    platform_enum=platform_enum,
+                    job_id=job_id,
+                    username=username,
+                    cursor=cursor,
+                    log=log,
                 )
-                with browser_guard:
-                    # ── 2. Acquire account ────────────────────
-                    account = account_pool.acquire_account(platform, job_id)
-                    account_id = account["account_id"]
-
-                    # ── 3. Cache stampede protection ──────────
-                    cache_lock_held = cache_mgr.acquire_populate_lock(
-                        platform, username
-                    )
-                    try:
-                        if not cache_lock_held:
-                            # Another worker is populating — check if result appeared
-                            log.info(
-                                f"Cache lock held by another worker for "
-                                f"{username}@{platform}",
-                            )
-                            cached = cache_mgr.get_profile(platform, username)
-                            if cached:
-                                job_state.set_completed(job_id, cached)
-                                circuit.record_success(platform)
-                                increment_counter("jobs_completed", platform)
-                                account_pool.release_account(
-                                    account_id, platform, apply_cooldown=False
-                                )
-                                account = None
-                                return cached
-
-                        # ── 4. Scrape ─────────────────────────
-                        ScraperClass = _get_scraper_class(platform)
-                        scraper = ScraperClass(account, session_mgr)
-
-                        with TimingContext("scrape_duration", platform):
-                            result = scraper.execute(username, cursor)
-
-                        # ── 5. Cache result ───────────────────
-                        cache_mgr.set_profile(platform, username, result)
-                        if result.get("next_cursor"):
-                            cache_mgr.set_page(
-                                platform,
-                                username,
-                                result["next_cursor"],
-                                result,
-                            )
-
-                        # ── 6. Store result + release ─────────
-                        job_state.set_completed(job_id, result)
-                        account_pool.release_account(account_id, platform)
-                        account = None
-
-                        circuit.record_success(platform)
-                        increment_counter("jobs_completed", platform)
-                        log.info(
-                            f"Job {job_id} completed successfully",
-                            extra={"job_id": job_id},
-                        )
-                        return result
-
-                    finally:
-                        if cache_lock_held:
-                            cache_mgr.release_populate_lock(platform, username)
-
-            except BrowserLimitError as e:
-                log.warning(
-                    f"Browser limit for job {job_id}: {e}",
-                    extra={"job_id": job_id},
-                )
-                if not retry_ctx.should_retry(e):
-                    raise
-                retry_ctx.wait()
-
-            except AccountBlockedError as e:
-                log.error(
-                    f"Account blocked: {e}",
-                    extra={"job_id": job_id},
-                )
-                circuit.record_failure(platform)
-                if account:
-                    account_pool.mark_invalid(
-                        account["account_id"], platform, str(e)
-                    )
-                    account = None
-                if not retry_ctx.should_retry(e):
-                    raise
-                retry_ctx.wait()
-
-            except SessionExpiredError as e:
-                log.warning(
-                    f"Session expired for account "
-                    f"{account['account_id'] if account else '?'}",
-                    extra={"job_id": job_id},
-                )
-                if account:
-                    session_mgr.mark_invalid(
-                        platform, account["account_id"], str(e)
-                    )
-                    account_pool.release_account(
-                        account["account_id"], platform, apply_cooldown=False
-                    )
-                    account = None
-                if not retry_ctx.should_retry(e):
-                    raise
-                retry_ctx.wait()
 
             except AccountUnavailableError:
+                # Pool is empty \u2014 retry won't help, surface immediately.
                 raise
 
-            except ParsingError as e:
-                log.error(
-                    f"Parsing error in job {job_id}: {e}",
-                    exc_info=True,
+            except ParsingError:
+                # Non-retryable; circuit failure already recorded inside.
+                raise
+
+            except (
+                AccountBlockedError,
+                SessionExpiredError,
+                BrowserLimitError,
+                ScrapingError,
+            ) as e:
+                if not retry_ctx.should_retry(e):
+                    raise
+                log.warning(
+                    "Retrying job %s after %s: %s",
+                    job_id, type(e).__name__, e,
+                    extra={"job_id": job_id},
+                )
+                retry_ctx.wait()
+
+            except Exception as e:
+                # Unknown error class \u2014 treat as transient but log loudly so
+                # we can promote it to a typed exception in a future revision.
+                log.exception(
+                    "Unexpected error in job %s attempt %s",
+                    job_id, attempt,
                     extra={"job_id": job_id},
                 )
                 circuit.record_failure(platform)
-                raise
-
-            except (ScrapingError, Exception) as e:
-                log.error(
-                    f"Scraping error in job {job_id} attempt {attempt}: {e}",
-                    extra={"job_id": job_id},
-                )
-                circuit.record_failure(platform)
-                if account:
-                    account_pool.release_account(
-                        account["account_id"], platform
-                    )
-                    account = None
                 if not retry_ctx.should_retry(e):
                     raise
                 retry_ctx.wait()
 
     except Exception as e:
-        job_state.set_failed(job_id, str(e))
-        dlq.push(job_id, platform, username, str(e), attempt)
-        increment_counter("jobs_failed", platform)
+        # Best-effort terminal-state write. If this itself fails we want the
+        # original exception to propagate (so RQ records the failure) but we
+        # must NOT clear the dedup key \u2014 leaving it in place causes the next
+        # identical request to be deduplicated against the now-stale job
+        # record until the dedup TTL expires, which is the safer failure
+        # mode than silently allowing duplicate scrapes against the same
+        # account.
+        try:
+            job_state.set_failed(job_id, str(e))
+            dlq.push(job_id, platform, username, str(e), attempt)
+            increment_counter("jobs_failed", platform)
+            outcome.mark_terminal()
+        except Exception:
+            log.exception(
+                "Failed to record terminal-failure state for job %s; "
+                "dedup key will be retained until TTL expiry", job_id,
+            )
         log.error(
-            f"Job {job_id} failed permanently: {e}",
+            "Job %s failed permanently: %s", job_id, e,
             extra={"job_id": job_id},
         )
         raise
 
     finally:
-        # Clean up: release account if still held, clear dedup key
-        if account:
+        # Only clear dedup once a terminal state has been persisted. If a
+        # crash or Redis failure prevented that write, the dedup key TTL
+        # (Config.JOB_DEDUP_TTL_SECONDS) is the recovery path.
+        if outcome.terminal_state_written:
             try:
-                account_pool.release_account(account["account_id"], platform)
+                job_state.clear_dedup(platform, username)
             except Exception:
-                pass
-        job_state.clear_dedup(platform, username)
+                log.exception(
+                    "Failed to clear dedup key for %s:%s; will expire via TTL",
+                    platform, username,
+                )

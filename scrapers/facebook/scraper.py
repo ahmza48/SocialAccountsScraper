@@ -3,6 +3,7 @@ import json
 from scrapers.base import BaseScraper
 from core.logging_config import get_logger
 from core.exceptions import ParsingError, ScrapingError, AccountBlockedError
+from core.platforms import Platform
 from utils.anti_detection import human_delay
 
 logger = get_logger(__name__)
@@ -11,7 +12,7 @@ logger = get_logger(__name__)
 class FacebookScraper(BaseScraper):
     """Facebook scraper using web interface with session reuse."""
 
-    PLATFORM = "facebook"
+    PLATFORM = Platform.FACEBOOK.value
     BASE_URL = "https://www.facebook.com"
 
     def _navigate_to_platform(self):

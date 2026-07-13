@@ -17,8 +17,11 @@ logger = get_logger(__name__)
 GLOBAL_BROWSER_KEY = "active:browsers"
 PLATFORM_BROWSER_KEY = "active:browsers:{platform}"
 
-# TTL for counter keys — safety net against leaked counters
-_COUNTER_TTL = 600
+# TTL for counter keys — safety net against leaked counters from crashed workers.
+# Tied to the job timeout (plus a graceful-shutdown buffer) so a slot can never
+# be held longer than the job that holds it could legitimately run.
+_COUNTER_TTL_BUFFER_SECONDS = 60
+_COUNTER_TTL = max(Config.JOB_TIMEOUT_SECONDS + _COUNTER_TTL_BUFFER_SECONDS, 120)
 
 # Lua: atomic check-and-increment with global + platform limits
 _ACQUIRE_LUA = """

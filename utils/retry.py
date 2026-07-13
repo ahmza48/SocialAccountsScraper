@@ -84,4 +84,3 @@ class RetryContext:
         delay = self.base_delay * (2 ** (self.attempt - 1)) + random.uniform(0, 1)
         logger.info(f"Retry wait: {delay:.1f}s (attempt {self.attempt})")
         time.sleep(delay)
-        time.sleep(delay)

@@ -113,10 +113,39 @@ class AsyncCircuitBreaker:
         state = await self._redis.get(self._state_key(platform))
         if state is None or state == self.CLOSED:
             return True
+
         if state == self.OPEN:
             opened_at = await self._redis.get(self._opened_at_key(platform))
-            if opened_at and (time.time() - float(opened_at)) > Config.CIRCUIT_BREAKER_RECOVERY_SECONDS:
-                await self._redis.set(self._state_key(platform), self.HALF_OPEN)
-                return True
-            return False
-        return True
+            recovered = (
+                opened_at
+                and (time.time() - float(opened_at))
+                > Config.CIRCUIT_BREAKER_RECOVERY_SECONDS
+            )
+            if not recovered:
+                return False
+            # Recovery window has elapsed. Try to claim THE probe permit;
+            # only the worker that wins is allowed through. The state is
+            # advanced to HALF_OPEN as a side-effect so observers (metrics,
+            # /metrics endpoint) see the transition.
+            if not await self._claim_probe(platform):
+                return False
+            await self._redis.set(self._state_key(platform), self.HALF_OPEN)
+            return True
+
+        # state == HALF_OPEN — gate behind the same probe permit so concurrent
+        # API workers don't all fan out probes during the recovery window.
+        return bool(await self._claim_probe(platform))
+
+    async def _claim_probe(self, platform: str) -> bool:
+        """Grant exactly one probe permit per recovery window.
+
+        Implemented as a SET NX EX so concurrent ``is_available`` callers
+        during the OPEN→HALF_OPEN transition only let a single probe through.
+        The TTL bounds how long we'll wait for the probe's outcome before
+        granting the next permit.
+        """
+        probe_key = f"circuit:{platform}:probe"
+        ttl = max(1, Config.CIRCUIT_BREAKER_RECOVERY_SECONDS)
+        return bool(
+            await self._redis.set(probe_key, "1", nx=True, ex=ttl)
+        )
